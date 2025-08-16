@@ -26,7 +26,7 @@ library(rio)
   The Data Exploration Assignment provided links to download the .zip file from https://seattleu.instructure.com/courses/1622414/files/71814703/download?wrap=1. Save to your local directory and open the file. In the following chunk, the user should define the paths prior to running this document to properly import data.
 
 ```{r}
-# NEW PATHS  || UNCOMMENT TO RUN IN GITHUB
+# NEW PATHS  || UNCOMMENT TO RUN VIA GITHUB
 # zip_rel <- file.path("..", "OMSBA_5300_S25_Data_Exploration_Assignment_-LP/Data_Exploration_Rawdata.zip") 
 # data_dir <- file.path("..", "OMSBA_5300_S25_Data_Exploration_Assignment_-LP/Lab3_Rawdata")                
 # 
