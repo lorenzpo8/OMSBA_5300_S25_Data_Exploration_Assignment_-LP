@@ -1,0 +1,381 @@
+---
+title: "Data Exploration Assignment"
+author: "Lorenzo Powell"
+date: "2025-08-12"
+output:
+  word_document: default
+  html_document: default
+---
+
+```{r}
+# load libraries
+library(tidyverse)
+library(fixest)
+library(ggplot2)
+library(ggeffects) # for marginal effects predictions
+library(stringr)
+library(lubridate)
+library(janitor) # for clean_names()
+library(broom) # for tidy() df construction || visualization
+library(readr)
+library(rio)
+```
+
+  To analyze the impacts of the College Scorecard on school interest we can use trends data from the most popular search engine, Google. My analysis aims to clearly indicate whether the policy implementation significantly impacts how prospective students engage with search tools for institutions considering their potential post-graduate outcomes.
+  
+  The Data Exploration Assignment provided links to download the .zip file from https://seattleu.instructure.com/courses/1622414/files/71814703/download?wrap=1. Save to your local directory and open the file. In the following chunk, the user should define the paths prior to running this document to properly import data.
+
+```{r}
+# NEW PATHS  || UNCOMMENT TO RUN IN GITHUB
+# zip_rel <- file.path("..", "OMSBA_5300_S25_Data_Exploration_Assignment_-LP/Data_Exploration_Rawdata.zip") 
+# data_dir <- file.path("..", "OMSBA_5300_S25_Data_Exploration_Assignment_-LP/Lab3_Rawdata")                
+# 
+# if (!dir.exists(data_dir)) {
+#   unzip(zip_rel, exdir = "..")
+# }
+# 
+# dir_path       <- data_dir
+# scorecard_path <- file.path(dir_path, "Most+Recent+Cohorts+(Scorecard+Elements).csv")
+# idlink_path    <- file.path(dir_path, "id_name_link.csv")
+
+# paths
+dir_path       <- '/Users/lorenzopowell/Desktop/Data Exploration Assignment/Lab3_Rawdata' # MODIFY PATH
+scorecard_path <- file.path(dir_path, 'Most+Recent+Cohorts+(Scorecard+Elements).csv')
+idlink_path    <- file.path(dir_path, 'id_name_link.csv')
+
+# read scorecard data & id_name_link
+scorecard <- import(scorecard_path) %>%
+  clean_names()
+id_link <- import(idlink_path) %>%
+  clean_names()
+
+# eliminate duplicate school entries from id_link
+if (!'schname' %in% names(id_link)) {
+  stop("`id_name_link.csv` no `schname` column present")
+}
+
+#final id_link
+id_link_new<- id_link %>%
+  group_by(schname) %>%
+  mutate(n = n()) %>%
+  ungroup() %>%
+  filter(n == 1) %>% # filtering multi-campus schools // may want to include alternate with inclusion
+  select(-n)
+
+# load trend data
+trend_files <- list.files(
+  path = dir_path,
+  pattern = '^trends_up_to_.*\\.csv$',
+  full.names = TRUE)
+
+# import and bind trend files
+trends_base <- import_list(trend_files, rbind = TRUE, fill = TRUE) %>%
+  clean_names()
+```
+
+  The Google Trends and College Scorecard data present ample information. The scorecard, released in September 2015, has highlighted and influenced student interest in institutions for favorable factors. Most notably post-graduate earning potential. Scorecard data in conjunction with associated Google search trends allows for explicit insights to be had after tidying, particularly if using a difference-in-differences approach. 
+
+  As guided by the assignment guide, the trends data is prepared by parsing dates and establishing a floor, coalescing school names for simplicity, and standardizing the search index. Indices are standardized within each school × keyword (z-scores) to ensure 1 index_std unit equals 1 SD relative to the group’s sample mean. For context, pre-standardization average school search interest stood at 47.16 with an SD of 21.50. On average, monthly search interest across institutions was 47% of the highest observed interest level. 
+  
+```{r}
+# clean dates
+trends_base <- trends_base %>%
+  mutate(
+    date  = ymd(str_sub(monthorweek, 1, 10)),
+    month = floor_date(date, unit = 'month')
+  ) %>%
+  dplyr::select(-any_of('file'))
+
+# pull column names
+index_col   <- intersect(c('index', 'value', 'hits'), names(trends_base)) |> first()
+keyword_col <- intersect(c('keyword', 'search_term', 'term'), names(trends_base)) |> first()
+
+# coalesce columns for school names in trends to 'schname'
+trends_base <- trends_base %>%
+  mutate(
+    schname = coalesce(
+      !!!syms(intersect(c('schname','school_name','college_name','institution','name'), names(.))) # use splice operator
+    )
+  )
+
+# fail fast validation block
+if (is.null(index_col)) stop('no index column value found')
+if (is.null(keyword_col)) stop('no keyword column value found')
+if (!'schname' %in% names(trends_base)) stop("could not make `schname` column in trends")
+
+trends_ready <- trends_base %>% 
+  group_by(schname, .data[[keyword_col]]) %>%
+  mutate(
+    index_std = (.data[[index_col]] - mean(.data[[index_col]], na.rm = TRUE)) /
+      sd(.data[[index_col]],  na.rm = TRUE)
+  ) %>%
+  ungroup()
+```
+
+  Data is aggregrated for trialing different intervals, additionally a more robust check to evaluate keyword search trends independent of specific schools. trends_school_month, which allows clean joining of Scorecard & Google Trends data and difference-in-difference estimates with fixed effects for school and date, was selected for the purpose of this investigation. Keyword based aggregation cannot distinguish between pre/post policy date; day/week data porved too noisy for stable FE estimates.Keeping the monthly school-level trends data allows for easy distribution into pre & post treatment groups and additional conditional variables to be implemented later.
+
+``` {r}
+# schools × month
+trends_school_month <- trends_ready %>%
+  group_by(schname, month, .data[[keyword_col]]) %>% #     !!sym(keyword_col)) %>%
+  summarise(index_std = mean(index_std, na.rm = TRUE), .groups = 'drop')
+
+# keywords × month ( all schools)  || unutilized 
+trends_kw_month <- trends_ready %>%
+  group_by(!!sym(keyword_col), month) %>%
+  summarise(index_std = mean(index_std, na.rm = TRUE), .groups = 'drop')
+
+# school × week/day || unutilized 
+trends_school_week <- trends_ready %>%
+  group_by(schname, date, !!sym(keyword_col)) %>%
+  summarise(index_std = mean(index_std, na.rm = TRUE), .groups = 'drop')
+```
+
+  Assembling the final data objects for exploration merges the cleaned and aggregated Google Trends data & College Scorecard data. To analyze school search trends and post graduate outcome beyond high and low earnings earnings, additional conditional variables were added for tuition cost and incurred debt. Some data exploration indicated strong colinearity (r = 0.70) between tuition cost and debt; debt was included in the final version as it is more akin structured to earnings as compared to cost in both data structure and conceptually as a defined value.  
+  
+  The final dataset serving as the source for future regressions is provided numerical indicators for both high-earnings. and high-debt. These conditional variables are imperative to building dataframes for useful regression models following column setup.
+
+``` {r}
+t_join <- trends_school_month %>%
+  inner_join(id_link_new, by = 'schname')
+
+# identify join keys existing in BOTH df's
+key_cand <- c('unitid', 'opeid', 'opeid6')
+join_key <- intersect(key_cand, intersect(names(t_join), names(scorecard)))
+
+if (length(join_key) == 0) {
+  stop('No common join keys found to link to Scorecard (need one of: unitid, opeid, opeid6).')
+}
+
+# key cols must be the symmetrical  ||  use character to avoid errors
+t_join2 <- t_join %>%
+  mutate(across(all_of(join_key), as.character))
+
+scorecard2 <- scorecard %>%
+  select(-any_of(c('insturl','npcurl'))) %>%
+  mutate(across(all_of(join_key), as.character))
+
+final_data <- t_join2 %>%
+  inner_join(scorecard2, by = join_key) %>%
+  mutate(
+    cost_num     = readr::parse_number(as.character(npt4_pub_average_annual_cost)),
+    debt_num     = readr::parse_number(as.character(grad_debt_mdn_supp)),
+    debt10yr_num = readr::parse_number(as.character(grad_debt_mdn10yr_supp))
+  )
+# write_csv(final_data, file.path(dir_path, "trends_scorecard_monthly.csv"))
+```
+
+``` {r}
+# define critical dates
+trend_first_date  <- min(trends_base$date,  na.rm = TRUE)
+policy_date <- as.Date('2015-09-12')
+
+# define earnings column
+earn_col <- names(final_data)[grepl('earn|wne|salary|income', names(final_data), ignore.case = TRUE)][1] # PARE SEARCH TEARMS  || only "md_earn_wne_p10_reported_earnings" present
+stopifnot(!is.na(earn_col))
+```
+
+``` {r}
+# assign single earnings value per school  ||  bypasses PrivacySuppressed to avoid error
+school_earn <- final_data %>%
+  distinct(schname, !!sym(earn_col)) %>%
+  mutate(earn_num = readr::parse_number(!!sym(earn_col))) %>% # MAY WANT TO CHANGE NAME FROM EARN NUM
+  filter(!is.na(earn_num))
+
+# split into high/low earning schools || 75th percentile
+cut75 <- quantile(school_earn$earn_num, 0.75, na.rm = TRUE)
+
+# post-grad debt & schooling cost
+school_cost_debt <- final_data %>%
+  distinct(schname, cost_num, debt_num, debt10yr_num)
+```
+
+  Performing feols() regression requires dataframe conversion; because a myriad of models were made for my analysis, I've retained 3 in my write-up with df and df2 being integral. The base dataframe df averages standardized search interest by school and month, then joins each school’s earnings and flags (relative to the policy_month) and high_earn (top-quartile earnings). df2 expands the dataset by merging the numeric cost & debt measures and creating high_cost & high_debt indicators using the same top-quartile rule. df_did includes a DiD-ready set with a single did indicator for schools that are both post-policy and high-earning). These DF's range from a simple baseline to ones containing interaction models with financial controls and still compatible with school and month fixed effects. 
+
+``` {r}
+# add policy date and earnings vars to assist regressions
+df <- final_data %>%
+  group_by(schname, month) %>%
+  summarise(index_std = mean(index_std, na.rm = TRUE), .groups = 'drop') %>%
+  left_join(school_earn %>% select(schname, earn_num), by = 'schname') %>% # join for earnings and index_std
+  mutate(
+    post      = month >= floor_date(policy_date, 'month'), # set policy date as floor
+    high_earn = earn_num >= cut75
+  )
+
+#  include quantiles for cost and debt || strong colinear relationship
+df2 <- df %>%  
+  left_join(school_cost_debt, by = "schname") %>%
+  mutate(
+    high_cost = cost_num >= quantile(cost_num, 0.75, na.rm = TRUE),
+    high_debt = debt_num >= quantile(debt_num, 0.75, na.rm = TRUE)
+  )
+
+# difference-in-differences
+df_did <- df2 %>%
+  mutate(
+    did = as.integer(post & high_earn)  # 1 if post == TRUE & high_earn == TRUE
+  )
+```
+
+  Key regressors are the interactions terms for  post × high_earn and post × high_debt. Because they are time-invariant, their main effects are absorbed by the fixed effects of school; thus the identified effects are the post × 'group' terms. Because cost and debt are correlated (r ≈ 0.70) the joint models are interpreted with some reservation; similar mindfulness should be employed when interpreting the standard errors as they are also two-way clustered by school and month.
+  
+  The initial, simple, regression model (reg1)  isolates the change in standardized search interest for schools in the top 25% of graduate earnings following the College Scorecard release. The coefficient on the interaction term is positive indicating that, when controlling for school and month fixed effects, high-earning schools experienced about 0.075 SD (p = 0.06) more search interest post-policy. This suggests a policy-driven increase in student attention to higher-earning institutions.
+
+  Investigating debts influence on search interest, reg3_dummy similarly isolates the change for the top 25% of high-debt schools.  The coefficient value −0.0883 SD (p < 0.01) indicates a clearly negative and significant post-policy decline in attention for the highest-debt institutions when controlling for both fixed effects and the main effects of post-policy and debt status.
+
+  In reg_did2 treatment is defined as 'high-earn & post' while controlling for affordability (tuition cost & high post-graduate debt). The previously established effect is again observable as both positive and significant  0.1620 SD (p < 0.05), nearly twice that of the baseline reg1. This is interpreted as the policy particularly increased the visibility of high-earning schools even after considering cost and debt as potential factors.
+
+  reg4 jointly examines interactions for both high-earning and high-debt classifications without the main effects for post-policy status; the model yields negative post effects for both groups—post × high_earn −0.1055 SD & post × high_debt −0.0684 SD (both p < 0.05).  It's implied that in the post-policy period, both high-earning and high-debt schools saw reduced search interest when these effects were estimated in the same model. The shift in sign for high-earnings compared to reg1 suggests that potential debt offsets the earnings effect when considered together.
+
+  The fully realized regression model (reg5) addresses the offset observed in reg4 by implementing terms for post, group dummies, and both interactions included. post × high_earn is positively significant at 0.0847 SD and post × high_debt is negatively significant at −0.0684 SD (both p < 0.05). The simplest interpretation is that the Scorecard release shifted attention toward high-earning schools and away from high-debt schools. The reg5 regression model proved optimal and anchors much of the analysis that follows.
+
+``` {r}
+reg1 <- feols(
+  index_std ~ post:high_earn | schname + month,
+  data = df,
+  vcov = ~ schname + month
+)
+# etable(reg1)
+
+reg3_dummy <- feols(
+  index_std ~ post + high_debt + post:high_debt | schname + month,
+  data = df2,
+  vcov = ~ schname + month
+)
+# etable(reg3_dummy)
+
+reg_did2 <- feols(
+  index_std ~ did + high_cost + high_debt | schname + month,
+  data = df_did,
+  vcov = ~ schname + month
+)
+# etable(reg_did2)
+
+reg4 <- feols( # THE OG OPTION
+  index_std ~ post:high_earn + high_debt + post:high_debt | schname + month,
+  data = df2,
+  vcov = ~ schname + month
+)
+# etable(reg4)
+
+reg5 <- feols( # THE GOLDEN OPTION
+  index_std ~ post + high_earn + post:high_earn + high_debt + post:high_debt | schname + month,
+  data = df2,
+  vcov = ~ schname + month
+)
+# etable(reg5)
+
+# etable(reg1, reg3_dummy, reg_did2, reg4, reg5)
+```
+
+  Being the most comprehensive regression models that adequately demonstrate the interaction effects, reg4 & reg5 were selected for plotting. reg4 isolates the post-policy × high-earn & post-policy × high-debt effects without main effects for post to highlight the independent interactions. reg5 augments its predecessor by including the main effects for post, high_earn, and high_debt to provide a more insights on policy impact in combination with financial considerations. Visualizations for these models could ease the assesment of how the inclusion of main effects changes the magnitude and direction of the interactions.
+
+  To properly convert the regression models for visualization, the broom library is implemented to quickly tidy and structure the model output. reg4_tidy filters the model to retain only the key interaction terms and subsequently recode them for simpler labeling. reg5_tidy filters for interaction terms with both post and  financial classifications (high earn & debt). 
+
+  These steps towards visualization support the difference-in-differences framework by facilitating interpretation of how the Scorecard shifted search interests for high-earning and high-debt institutions, both independently and in combination with other financial factors.
+
+``` {r}
+# reg4
+reg4_tidy <- tidy(reg4, conf.int = TRUE) # tidy the coeff's & SE's
+reg4_tidy <- reg4_tidy %>%
+  filter(term %in% c('postTRUE:high_earnTRUE', 'high_debtTRUE', 'postTRUE:high_debtTRUE')) %>%
+  mutate(
+    term = recode(term, # streamline names
+                  'postTRUE:high_earnTRUE' = 'post × high-earn',
+                  'high_debtTRUE' = 'high-debt',
+                  'postTRUE:high_debtTRUE' = 'post × high-debt'
+    )
+  )
+
+# reg5
+reg5_tidy <- tidy(reg5, conf.int = TRUE)
+reg5_dids <- reg5_tidy %>%
+  filter(grepl('post.*:.*high_earn|high_earn.*:.*post', term) |
+           grepl('post.*:.*high_debt|high_debt.*:.*post', term)) %>%
+  mutate(
+    label = case_when(
+      grepl('high_earn', term) ~ 'Post × High-earn (DiD)',
+      grepl('high_debt', term) ~ 'Post × High-debt (DiD)',
+      TRUE ~ term
+    ),
+    label = factor(label, levels = c('Post × High-earn (DiD)',
+                                     'Post × High-debt (DiD)'))
+  )
+```
+
+  Generating visualizations continues to prove a challenge for me, however the two included provide a fair presentation of the observed effect. Plotting the reg4 model only produced the visualization for high debt institutions, despite the regression model being as previously described. The latter, reg5_plot clearly portrays its regression model by displaying the effect of the scorecard on search interest in institutions with high earning and high debt post-graduate experiences.
+  
+  Unfortunately, reg4_plot only displays debt data, not earnings. While the plot is clear and interpretable, it lacks the utility to investigate the Scorecard's effects on high-earning institutions. reg4_plot ultimately is highly restricted its ability to portray how both earnings and debt shape student search interest.
+  
+``` {r}
+# reg4
+# ONLY ASSESSES DEBT NOT EARNINGS
+reg4_plot <- ggplot(reg4_tidy, aes(x = term, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 0, linetype = 'dashed', color = 'purple') +
+  geom_pointrange(size = 0.8) +
+  coord_flip() +
+  labs(
+    title = 'policy effect on search interest',
+    x = NULL,
+    y = 'measured effect (sd)'
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(
+  filename = file.path(dir_path,'reg4_plot.pdf'),
+  plot = reg4_plot,
+  device = 'pdf',
+  width = 18, height = 8
+)
+
+show(reg4_plot)
+
+# reg5
+reg5_plot <- ggplot(reg5_dids, aes(x = label, y = estimate, ymin = conf.low, ymax = conf.high)) +
+  geom_hline(yintercept = 0, linetype = 'dashed') +
+  geom_pointrange(size = 0.9) +
+  geom_text(aes(label = round(estimate, 4)),
+            hjust = -0.3, # horiz adj
+            vjust = -0.8, # vert adj
+            size = 4) +                     
+  coord_flip() +
+  labs(
+    title = 'policy effect for schools by postgrad factors (reg5)',
+    subtitle = 'at the 95%  CI',
+    x = NULL, y = 'effect (SD)'
+  ) +
+  theme_minimal(base_size = 12)
+
+ggsave(
+  filename = file.path(dir_path,'reg5_plot.pdf'),
+  plot = reg5_plot,
+  device = 'pdf',
+  width = 18, height = 8
+)
+
+show(reg5_plot)
+```
+
+``` {r}
+# General Metrics & Summaries
+
+# summary(final_data)
+
+# summary(school_earn$earn_num)
+
+# regression metric cluster
+etable(reg1, reg3_dummy, reg_did2, reg4, reg5)
+
+# pearson || colinearity 
+# cor(final_data$cost_num, final_data$debt_num, use = "complete.obs")
+
+# mean & SD of index's [global assessments essentially useless at present]
+index_mean <- mean(as.numeric(trends_base$index), na.rm = TRUE)
+index_sd <- sd(as.numeric(trends_base$index), na.rm = TRUE)
+```
+  
+  There is a measurable and observable shift in student interest following the Scorecard’s release.  High-earning institutions experienced a statistically significant increase in search interest, while high-debt institutions saw a corresponding decline. These effects persisted when controlling for notable financial factors, suggesting the policy has actively influenced prospective student behavior consistent with its intent. While the difference-in-differences approach can isolate the treatment effect, it still assumes parallel pre-policy trends and some apparent colinearity between earnings & debt classifications detracts from the findings. Despite the observed effects modesty, they are directionally consistent and statistically precise which are of greater importance at scale. However, the findings offer evidence that the Scorecard’s introduction reshaped the competitive landscape of higher education visibility, favoring institutions with stronger post-graduate financial outconmes.
+
+
+
